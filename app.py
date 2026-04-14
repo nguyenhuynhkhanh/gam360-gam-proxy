@@ -148,6 +148,12 @@ def health():
         }), 503
 
 
+@app.route("/gam/ad-units/batch", methods=["GET"])
+def ad_units_batch():
+    """GET /gam/ad-units/batch?ids=<csv> — fetch multiple ad units by GAM ID."""
+    return _get_ad_units_batch()
+
+
 @app.route("/gam/ad-units", methods=["GET", "POST"])
 def ad_units():
     if request.method == "GET":
@@ -161,6 +167,105 @@ def modify_ad_unit(gam_id):
     if request.method == "DELETE":
         return _archive_ad_unit(gam_id)
     return _update_ad_unit(gam_id)
+
+
+def _get_ad_units_batch():
+    """GET /gam/ad-units/batch?ids=<csv> — fetch multiple ad units by GAM ID with sizes."""
+    ids_param = request.args.get("ids", "")
+    if not ids_param:
+        return jsonify({
+            "error": "VALIDATION_ERROR",
+            "message": "ids query parameter is required",
+        }), 400
+
+    gam_ids = [s.strip() for s in ids_param.split(",") if s.strip()]
+    if not gam_ids:
+        return jsonify({"adUnits": []}), 200
+
+    try:
+        inventory_service = _inventory_service()
+        all_results = []
+        page_size = 100
+
+        # Process in chunks to respect SOAP query limits
+        for chunk_start in range(0, len(gam_ids), page_size):
+            chunk = gam_ids[chunk_start:chunk_start + page_size]
+            id_list = ", ".join(chunk)
+            where_clause = f"id IN ({id_list})"
+
+            offset = 0
+            while True:
+                statement = (
+                    ad_manager.StatementBuilder(version=API_VERSION)
+                    .Where(where_clause)
+                    .Limit(page_size)
+                    .Offset(offset)
+                )
+
+                response = inventory_service.getAdUnitsByStatement(
+                    statement.ToStatement()
+                )
+
+                results = None
+                if isinstance(response, dict):
+                    results = response.get("results", None)
+                else:
+                    results = getattr(response, "results", None)
+
+                if not results or len(results) == 0:
+                    break
+
+                for ad_unit in results:
+                    unit_id = ad_unit["id"] if isinstance(ad_unit, dict) else ad_unit.id
+                    unit_code = (ad_unit["adUnitCode"] if isinstance(ad_unit, dict) else getattr(ad_unit, "adUnitCode", None)) or ""
+
+                    # Extract sizes
+                    raw_sizes = []
+                    if isinstance(ad_unit, dict):
+                        raw_sizes = ad_unit.get("adUnitSizes", []) or []
+                    else:
+                        raw_sizes = getattr(ad_unit, "adUnitSizes", []) or []
+
+                    sizes = []
+                    for size_entry in raw_sizes:
+                        if isinstance(size_entry, dict):
+                            s = size_entry.get("size", {})
+                            env_type = size_entry.get("environmentType", "BROWSER")
+                            is_fluid = size_entry.get("isFluid", False)
+                            width = s.get("width", 0)
+                            height = s.get("height", 0)
+                        else:
+                            s = getattr(size_entry, "size", None)
+                            env_type = getattr(size_entry, "environmentType", "BROWSER")
+                            is_fluid = getattr(size_entry, "isFluid", False)
+                            width = getattr(s, "width", 0) if s else 0
+                            height = getattr(s, "height", 0) if s else 0
+
+                        sizes.append({
+                            "width": int(width),
+                            "height": int(height),
+                            "environmentType": str(env_type),
+                            "isFluid": bool(is_fluid),
+                        })
+
+                    all_results.append({
+                        "id": str(unit_id),
+                        "adUnitCode": str(unit_code),
+                        "sizes": sizes,
+                    })
+
+                if len(results) < page_size:
+                    break
+                offset += page_size
+
+        return jsonify({"adUnits": all_results}), 200
+
+    except Exception as exc:
+        logger.exception("Batch lookup ad units failed")
+        return jsonify({
+            "error": "GAM_ERROR",
+            "message": f"getAdUnitsByStatement batch failed: {exc}",
+        }), 500
 
 
 def _get_ad_unit():
