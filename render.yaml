@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: gam360-gam-proxy
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 120
+    envVars:
+      - key: GAM_NETWORK_CODE
+        sync: false
+      - key: GAM_KEY_FILE
+        sync: false
+      - key: PROXY_SECRET
+        generateValue: true

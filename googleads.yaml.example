@@ -1,0 +1,4 @@
+ad_manager:
+  application_name: "vtvprime-gam360"
+  network_code: "<NETWORK_CODE>"
+  path_to_private_key_file: "<path to service account JSON key>"

@@ -31,13 +31,41 @@ CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "googlead
 API_VERSION = "v202602"
 
 def _load_client():
-    """Load the AdManagerClient from googleads.yaml.  Exits the process if the
-    config file is missing so the proxy fails fast at startup."""
+    """Load the AdManagerClient.
+    Supports two modes:
+    1. googleads.yaml file (local dev)
+    2. GAM_SERVICE_ACCOUNT_JSON env var (Render/cloud deployment)
+    """
+    sa_json = os.environ.get("GAM_SERVICE_ACCOUNT_JSON")
+    network_code = os.environ.get("GAM_NETWORK_CODE")
+
+    if sa_json and network_code:
+        # Cloud mode: generate config files from env vars
+        import json
+        import tempfile
+
+        # Write service account key to temp file
+        key_path = os.path.join(tempfile.gettempdir(), "gam-sa-key.json")
+        with open(key_path, "w") as f:
+            f.write(sa_json)
+
+        # Write googleads.yaml config to temp file
+        yaml_path = os.path.join(tempfile.gettempdir(), "googleads.yaml")
+        with open(yaml_path, "w") as f:
+            f.write(
+                f"ad_manager:\n"
+                f"  application_name: gam360-proxy\n"
+                f"  network_code: \"{network_code}\"\n"
+                f"  path_to_private_key_file: \"{key_path}\"\n"
+            )
+
+        logger.info("Loading GAM client from environment variables")
+        return ad_manager.AdManagerClient.LoadFromStorage(yaml_path)
+
+    # Local dev: use googleads.yaml file
     if not os.path.isfile(CONFIG_PATH):
         logger.error(
-            "ERROR: googleads.yaml not found at %s. "
-            "Copy googleads.yaml.example to googleads.yaml and fill in your "
-            "service account credentials before starting the proxy.",
+            "ERROR: googleads.yaml not found at %s and GAM_SERVICE_ACCOUNT_JSON not set.",
             CONFIG_PATH,
         )
         sys.exit(1)
@@ -50,6 +78,18 @@ client = _load_client()
 # Flask app
 # ---------------------------------------------------------------------------
 app = Flask(__name__)
+
+PROXY_SECRET = os.environ.get("PROXY_SECRET", "")
+
+
+@app.before_request
+def check_proxy_secret():
+    """Reject requests without valid proxy secret (skip in local dev)."""
+    if not PROXY_SECRET:
+        return  # No secret configured = local dev, allow all
+    token = request.headers.get("X-Proxy-Secret", "")
+    if token != PROXY_SECRET:
+        return jsonify({"error": "UNAUTHORIZED", "message": "Invalid proxy secret"}), 401
 
 
 # -- helpers ----------------------------------------------------------------
