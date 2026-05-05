@@ -283,7 +283,16 @@ def _get_ad_unit():
     try:
         inventory_service = _inventory_service()
 
-        if name and parent_id:
+        if code and parent_id:
+            statement = (
+                ad_manager.StatementBuilder(version=API_VERSION)
+                .Where("adUnitCode = :code AND parentId = :parentId")
+                .WithBindVariable("code", code)
+                .WithBindVariable("parentId", int(parent_id))
+                .Limit(1)
+                .Offset(0)
+            )
+        elif name and parent_id:
             statement = (
                 ad_manager.StatementBuilder(version=API_VERSION)
                 .Where("name = :name AND parentId = :parentId")
