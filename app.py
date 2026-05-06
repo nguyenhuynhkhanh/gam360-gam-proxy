@@ -188,12 +188,11 @@ def _get_all_leaf_ad_units():
         all_units = []
 
         while True:
-            # Use a valid PQL filter: parentId IS NOT NULL excludes the root node only.
-            # hasChildren is NOT a filterable PQL column — it is a computed response field.
-            # Leaf identification is done via Python post-filter below.
+            # No WHERE filter — fetch all ad units and post-filter in Python.
+            # hasChildren is NOT a PQL-filterable column (computed response field only).
+            # parentId IS NOT NULL was also unreliable — GAM returned 0 results silently.
             statement = (
                 ad_manager.StatementBuilder(version=API_VERSION)
-                .Where("parentId IS NOT NULL")
                 .Limit(page_size)
                 .Offset(offset)
             )
