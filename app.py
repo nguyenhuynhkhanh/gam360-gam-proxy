@@ -217,15 +217,6 @@ def _get_all_leaf_ad_units():
             raw_result_count = len(results)
 
             for ad_unit in results:
-                # Post-filter: skip hierarchy nodes (hasChildren=True).
-                # hasChildren is a valid SOAP response field but NOT a PQL filter column.
-                has_children = (
-                    ad_unit.get("hasChildren", False) if isinstance(ad_unit, dict)
-                    else getattr(ad_unit, "hasChildren", False)
-                )
-                if has_children:
-                    continue  # Skip non-leaf (hierarchy) nodes
-
                 unit_id = ad_unit["id"] if isinstance(ad_unit, dict) else ad_unit.id
                 unit_code = (ad_unit["adUnitCode"] if isinstance(ad_unit, dict) else getattr(ad_unit, "adUnitCode", None)) or ""
                 unit_name = (ad_unit["name"] if isinstance(ad_unit, dict) else getattr(ad_unit, "name", None)) or ""
