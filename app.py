@@ -148,6 +148,12 @@ def health():
         }), 503
 
 
+@app.route("/gam/ad-units/all", methods=["GET"])
+def ad_units_all():
+    """GET /gam/ad-units/all?env=dev — bulk pull all leaf ad units (hasChildren=false)."""
+    return _get_all_leaf_ad_units()
+
+
 @app.route("/gam/ad-units/batch", methods=["GET"])
 def ad_units_batch():
     """GET /gam/ad-units/batch?ids=<csv> — fetch multiple ad units by GAM ID."""
@@ -167,6 +173,109 @@ def modify_ad_unit(gam_id):
     if request.method == "DELETE":
         return _archive_ad_unit(gam_id)
     return _update_ad_unit(gam_id)
+
+
+def _get_all_leaf_ad_units():
+    """GET /gam/ad-units/all?env=dev — paginated pull of all leaf ad units (hasChildren=false)."""
+    import json as _json
+    env_label = request.args.get("env", "dev")
+    logger.info("Fetching all leaf ad units for env=%s", env_label)
+
+    try:
+        inventory_service = _inventory_service()
+        page_size = 500
+        offset = 0
+        all_units = []
+
+        while True:
+            statement = (
+                ad_manager.StatementBuilder(version=API_VERSION)
+                .Where("hasChildren = false")
+                .Limit(page_size)
+                .Offset(offset)
+            )
+
+            response = inventory_service.getAdUnitsByStatement(
+                statement.ToStatement()
+            )
+
+            results = None
+            if isinstance(response, dict):
+                results = response.get("results", None)
+            else:
+                results = getattr(response, "results", None)
+
+            if not results or len(results) == 0:
+                break
+
+            for ad_unit in results:
+                unit_id = ad_unit["id"] if isinstance(ad_unit, dict) else ad_unit.id
+                unit_code = (ad_unit["adUnitCode"] if isinstance(ad_unit, dict) else getattr(ad_unit, "adUnitCode", None)) or ""
+                unit_name = (ad_unit["name"] if isinstance(ad_unit, dict) else getattr(ad_unit, "name", None)) or ""
+                unit_status = (ad_unit["status"] if isinstance(ad_unit, dict) else getattr(ad_unit, "status", None)) or ""
+                parent_id = ad_unit["parentId"] if isinstance(ad_unit, dict) else getattr(ad_unit, "parentId", None)
+
+                # Extract sizes
+                raw_sizes = []
+                if isinstance(ad_unit, dict):
+                    raw_sizes = ad_unit.get("adUnitSizes", []) or []
+                else:
+                    raw_sizes = getattr(ad_unit, "adUnitSizes", []) or []
+
+                sizes_banner = []
+                sizes_vast = []
+                has_fluid = False
+
+                for size_entry in raw_sizes:
+                    if isinstance(size_entry, dict):
+                        s = size_entry.get("size", {})
+                        env_type = size_entry.get("environmentType", "BROWSER")
+                        is_fluid = size_entry.get("isFluid", False)
+                        width = s.get("width", 0) if isinstance(s, dict) else getattr(s, "width", 0)
+                        height = s.get("height", 0) if isinstance(s, dict) else getattr(s, "height", 0)
+                    else:
+                        s = getattr(size_entry, "size", None)
+                        env_type = getattr(size_entry, "environmentType", "BROWSER")
+                        is_fluid = getattr(size_entry, "isFluid", False)
+                        width = getattr(s, "width", 0) if s else 0
+                        height = getattr(s, "height", 0) if s else 0
+
+                    if is_fluid:
+                        has_fluid = True
+                        continue  # Fluid 1x1 is not a real size, skip it
+
+                    size_str = f"{int(width)}x{int(height)}"
+                    if str(env_type) == "VIDEO_PLAYER":
+                        sizes_vast.append(size_str)
+                    else:
+                        sizes_banner.append(size_str)
+
+                size_mode = "Fluid" if has_fluid else "Fixed"
+
+                all_units.append({
+                    "gam_id": str(unit_id),
+                    "ad_unit_code": str(unit_code),
+                    "name": str(unit_name),
+                    "sizes_banner": _json.dumps(sizes_banner),
+                    "sizes_vast": _json.dumps(sizes_vast),
+                    "size_mode": size_mode,
+                    "status": str(unit_status),
+                    "parent_gam_id": str(parent_id) if parent_id is not None else None,
+                })
+
+            if len(results) < page_size:
+                break
+            offset += page_size
+
+        logger.info("Fetched %d leaf ad units for env=%s", len(all_units), env_label)
+        return jsonify(all_units), 200
+
+    except Exception as exc:
+        logger.exception("Failed to fetch all leaf ad units")
+        return jsonify({
+            "error": "GAM_ERROR",
+            "message": f"getAdUnitsByStatement (all leaf) failed: {exc}",
+        }), 500
 
 
 def _get_ad_units_batch():
