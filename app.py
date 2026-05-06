@@ -201,11 +201,10 @@ def _get_all_leaf_ad_units():
                 statement.ToStatement()
             )
 
-            results = None
-            if isinstance(response, dict):
-                results = response.get("results", None)
-            else:
-                results = getattr(response, "results", None)
+            total = getattr(response, 'totalResultSetSize', None) or (response.get('totalResultSetSize') if isinstance(response, dict) else None)
+            results = response.get("results", None) if isinstance(response, dict) else getattr(response, "results", None)
+            logger.info("GAM page offset=%d: totalResultSetSize=%s results_type=%s results_len=%s",
+                        offset, total, type(results).__name__, len(results) if results is not None else 'None')
 
             if not results or len(results) == 0:
                 break
