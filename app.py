@@ -10,6 +10,7 @@ Endpoints:
 
 import logging
 import os
+import re
 import sys
 
 from flask import Flask, jsonify, request
@@ -102,28 +103,105 @@ def _network_service():
     return client.GetService("NetworkService", version=API_VERSION)
 
 
-def _is_already_exists(fault):
-    """Return True when the SOAP fault indicates the ad unit already exists."""
+# gam-resilience-foundation FR-10: structured-fault inspection.
+# Inspect getattr(fault, 'errors', []) first; iterate ApiError elements and
+# match canonical error class identifiers against errorString. Fall back to
+# substring matching on str(fault) only when .errors is absent or empty
+# (older SDKs / unexpected fault shapes), and emit logger.warning so operators
+# know the structured path was bypassed (BR-7).
+_RATE_LIMIT_TOKENS = (
+    "QuotaError.EXCEEDED_QUOTA",
+    "QuotaError.PUBLISHER_QUOTA_EXCEEDED",
+    "RateExceededError",
+    "RATE_EXCEEDED",
+    "RATE_LIMITED",
+    "PUBLISHER_QUOTA_EXCEEDED",
+    "TOO_MANY_REQUESTS",
+    # The legacy substring tokens are kept so that the existing test
+    # FakeGoogleAdsServerFault('QuotaError: rate limit exceeded') still
+    # classifies True via the fallback path (FR-13 / AC-15).
+    "QuotaError",
+)
+_ALREADY_EXISTS_TOKENS = (
+    "UniqueError.NOT_UNIQUE",
+    "CommonError.ALREADY_EXISTS",
+    "ALREADY_EXISTS",
+    "NOT_UNIQUE",
+    "UniqueError",  # legacy substring fallback token (FR-13).
+)
+
+
+def _classify_fault(fault, tokens):
+    """Inspect fault.errors first; fall back to substring on str(fault).
+
+    Returns True if any ApiError matches one of `tokens` via the structured
+    path, OR if any token appears in str(fault) via the fallback path. The
+    fallback emits a logger.warning so operators detect when the structured
+    path is bypassed (typically after a googleads SDK upgrade).
+    """
+    api_errors = getattr(fault, "errors", None)
+    if api_errors:  # truthy list with at least one entry
+        for api_error in api_errors:
+            error_string = getattr(api_error, "errorString", "") or ""
+            for token in tokens:
+                if token in error_string:
+                    return True
+        # Structured path was taken but matched nothing — definitive negative.
+        return False
+
+    # Fallback path: .errors is None, missing, or empty.
+    logger.warning(
+        "Falling back to substring match for fault: %s",
+        type(fault).__name__,
+    )
     fault_str = str(fault)
-    if "UniqueError" in fault_str:
-        return True
-    if "ALREADY_EXISTS" in fault_str:
-        return True
-    return False
+    return any(token in fault_str for token in tokens)
 
 
 def _is_rate_limited(fault):
     """Return True when the SOAP fault indicates quota / rate limiting."""
-    fault_str = str(fault)
-    if "QuotaError" in fault_str:
-        return True
-    if "RATE_LIMITED" in fault_str:
-        return True
-    if "RateExceededError" in fault_str:
-        return True
-    if "TOO_MANY_REQUESTS" in fault_str:
-        return True
-    return False
+    return _classify_fault(fault, _RATE_LIMIT_TOKENS)
+
+
+def _is_already_exists(fault):
+    """Return True when the SOAP fault indicates the ad unit already exists."""
+    return _classify_fault(fault, _ALREADY_EXISTS_TOKENS)
+
+
+# gam-resilience-foundation FR-11/FR-12 / INV-TBD-c: sanitize JSON response
+# `error.message` payloads at the proxy boundary. Strip <env:...>...</env:...>
+# SOAP envelopes (DOTALL — they can span newlines), strip http(s) URLs,
+# truncate at the first newline, and cap at 500 chars + ellipsis. Pure /
+# deterministic / no side effects (NFR-5).
+# Greedy match: outermost `<env:...>...</env:...>` pair. The greedy `.*` is
+# what spec FR-11 calls for ("multi-line, greedy") and is what handles nested
+# envelopes (the standard SOAP shape: `<env:Envelope><env:Body/></env:Envelope>`)
+# in a single sub() call.
+_ENV_TAG_RE = re.compile(r"<env:[^>]+>.*</env:[^>]+>", re.DOTALL | re.IGNORECASE)
+# Defensive cleanup of any unmatched stray <env:...> or </env:...> tag the
+# pair-stripper missed (malformed envelopes lacking one half).
+_STRAY_ENV_TAG_RE = re.compile(r"</?env:[^>]*>", re.IGNORECASE)
+_URL_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)
+_SANITIZED_MAX = 500
+
+
+def _sanitize_fault_message(message):
+    """Strip SOAP envelope tags and URLs, truncate at first newline, cap length."""
+    if message is None:
+        return ""
+    s = str(message)
+    # Strip the (greedy) outermost env:* envelope pair — handles nested SOAP
+    # envelopes in a single pass.
+    s = _ENV_TAG_RE.sub("", s)
+    # Defense-in-depth: strip any leftover stray env:* tags from malformed
+    # input (e.g., an opening tag with no matching close).
+    s = _STRAY_ENV_TAG_RE.sub("", s)
+    s = _URL_RE.sub("", s)
+    if "\n" in s:
+        s = s.split("\n", 1)[0]
+    if len(s) > _SANITIZED_MAX:
+        s = s[:_SANITIZED_MAX] + "..."
+    return s
 
 
 # -- endpoints --------------------------------------------------------------
@@ -144,7 +222,7 @@ def health():
         logger.exception("Health check failed")
         return jsonify({
             "status": "error",
-            "message": str(exc),
+            "message": _sanitize_fault_message(str(exc)),
         }), 503
 
 
@@ -278,7 +356,7 @@ def _get_all_leaf_ad_units():
         logger.exception("Failed to fetch all leaf ad units")
         return jsonify({
             "error": "GAM_ERROR",
-            "message": f"getAdUnitsByStatement (all leaf) failed: {exc}",
+            "message": f"getAdUnitsByStatement (all leaf) failed: {_sanitize_fault_message(exc)}",
         }), 500
 
 
@@ -377,7 +455,7 @@ def _get_ad_units_batch():
         logger.exception("Batch lookup ad units failed")
         return jsonify({
             "error": "GAM_ERROR",
-            "message": f"getAdUnitsByStatement batch failed: {exc}",
+            "message": f"getAdUnitsByStatement batch failed: {_sanitize_fault_message(exc)}",
         }), 500
 
 
@@ -443,7 +521,7 @@ def _get_ad_unit():
         logger.exception("Lookup ad unit failed for code=%s", code)
         return jsonify({
             "error": "GAM_ERROR",
-            "message": f"getAdUnitsByStatement failed: {exc}",
+            "message": f"getAdUnitsByStatement failed: {_sanitize_fault_message(exc)}",
         }), 500
 
 
@@ -526,14 +604,14 @@ def _create_ad_unit():
 
         return jsonify({
             "error": "GAM_ERROR",
-            "message": f"InventoryService.createAdUnits failed: {fault}",
+            "message": f"InventoryService.createAdUnits failed: {_sanitize_fault_message(fault)}",
         }), 500
 
     except Exception as exc:
         logger.exception("Unexpected error creating ad unit")
         return jsonify({
             "error": "GAM_ERROR",
-            "message": f"InventoryService.createAdUnits failed: {exc}",
+            "message": f"InventoryService.createAdUnits failed: {_sanitize_fault_message(exc)}",
         }), 500
 
 
@@ -599,14 +677,14 @@ def _update_ad_unit(gam_id):
 
         return jsonify({
             "error": "GAM_ERROR",
-            "message": f"InventoryService.updateAdUnits failed: {fault}",
+            "message": f"InventoryService.updateAdUnits failed: {_sanitize_fault_message(fault)}",
         }), 500
 
     except Exception as exc:
         logger.exception("Unexpected error updating ad unit %s", gam_id)
         return jsonify({
             "error": "GAM_ERROR",
-            "message": f"InventoryService.updateAdUnits failed: {exc}",
+            "message": f"InventoryService.updateAdUnits failed: {_sanitize_fault_message(exc)}",
         }), 500
 
 
@@ -674,14 +752,14 @@ def _archive_ad_unit(gam_id):
 
         return jsonify({
             "error": "GAM_ERROR",
-            "message": f"Archive failed: {fault}",
+            "message": f"Archive failed: {_sanitize_fault_message(fault)}",
         }), 500
 
     except Exception as exc:
         logger.exception("Unexpected error archiving ad unit %s", gam_id)
         return jsonify({
             "error": "GAM_ERROR",
-            "message": f"Archive failed: {exc}",
+            "message": f"Archive failed: {_sanitize_fault_message(exc)}",
         }), 500
 
 
