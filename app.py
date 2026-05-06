@@ -188,9 +188,12 @@ def _get_all_leaf_ad_units():
         all_units = []
 
         while True:
+            # Use a valid PQL filter: parentId IS NOT NULL excludes the root node only.
+            # hasChildren is NOT a filterable PQL column — it is a computed response field.
+            # Leaf identification is done via Python post-filter below.
             statement = (
                 ad_manager.StatementBuilder(version=API_VERSION)
-                .Where("hasChildren = false")
+                .Where("parentId IS NOT NULL")
                 .Limit(page_size)
                 .Offset(offset)
             )
@@ -208,7 +211,22 @@ def _get_all_leaf_ad_units():
             if not results or len(results) == 0:
                 break
 
+            # CRITICAL: capture raw SOAP result count BEFORE post-filtering.
+            # The pagination break condition (len(results) < page_size) must use
+            # this raw count, not the filtered count — otherwise pages are skipped
+            # when an entire page consists of non-leaf nodes.
+            raw_result_count = len(results)
+
             for ad_unit in results:
+                # Post-filter: skip hierarchy nodes (hasChildren=True).
+                # hasChildren is a valid SOAP response field but NOT a PQL filter column.
+                has_children = (
+                    ad_unit.get("hasChildren", False) if isinstance(ad_unit, dict)
+                    else getattr(ad_unit, "hasChildren", False)
+                )
+                if has_children:
+                    continue  # Skip non-leaf (hierarchy) nodes
+
                 unit_id = ad_unit["id"] if isinstance(ad_unit, dict) else ad_unit.id
                 unit_code = (ad_unit["adUnitCode"] if isinstance(ad_unit, dict) else getattr(ad_unit, "adUnitCode", None)) or ""
                 unit_name = (ad_unit["name"] if isinstance(ad_unit, dict) else getattr(ad_unit, "name", None)) or ""
@@ -263,7 +281,7 @@ def _get_all_leaf_ad_units():
                     "parent_gam_id": str(parent_id) if parent_id is not None else None,
                 })
 
-            if len(results) < page_size:
+            if raw_result_count < page_size:
                 break
             offset += page_size
 

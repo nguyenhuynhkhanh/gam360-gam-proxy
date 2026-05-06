@@ -378,5 +378,193 @@ class TestStartupWithoutConfig(unittest.TestCase):
             self.assertEqual(ctx.exception.code, 1)
 
 
+# =========================================================================
+# RED-PHASE TESTS: gam-proxy-leaf-filter bug
+# These tests prove the bug before the fix is applied.
+# After the fix, they serve as regression guards.
+# =========================================================================
+
+class TestGetAllLeafAdUnits(BaseTestCase):
+    """Tests for GET /gam/ad-units/all (bug: hasChildren PQL filter)."""
+
+    def _make_ad_unit(self, unit_id, code, has_children, parent_id="10001"):
+        """Return a dict-style SOAP result ad unit."""
+        return {
+            "id": unit_id,
+            "adUnitCode": code,
+            "name": code.split("/")[-1],
+            "status": "ACTIVE",
+            "parentId": parent_id,
+            "hasChildren": has_children,
+            "adUnitSizes": [
+                {
+                    "size": {"width": 300, "height": 250},
+                    "environmentType": "BROWSER",
+                    "isFluid": False,
+                }
+            ],
+        }
+
+    def _setup_sb_mock(self, where_clauses_captured=None):
+        """Return a mock StatementBuilder instance that captures Where() calls."""
+        mock_sb = MagicMock()
+        mock_sb.Where.side_effect = lambda clause: (
+            where_clauses_captured.append(clause) or mock_sb
+            if where_clauses_captured is not None
+            else mock_sb
+        )
+        mock_sb.Limit.return_value = mock_sb
+        mock_sb.Offset.return_value = mock_sb
+        mock_sb.ToStatement.return_value = "fake_statement"
+        return mock_sb
+
+    # ------------------------------------------------------------------
+    # s10: Happy path — mix of leaf and non-leaf, only leaves returned
+    # ------------------------------------------------------------------
+    def test_s10_leaf_only_returned(self):
+        """AC-2/AC-3: Only leaf nodes (hasChildren=False) are in the response."""
+        leaf_unit = self._make_ad_unit("201", "vtvprime/mob/home/stlight", False)
+        hierarchy_unit = self._make_ad_unit("202", "vtvprime/mob/home", True)
+
+        mock_inventory = MagicMock()
+        # First call returns mixed results, second call returns empty (end of pages)
+        mock_inventory.getAdUnitsByStatement.side_effect = [
+            {"results": [leaf_unit, hierarchy_unit]},
+            {"results": None},
+        ]
+
+        where_clauses = []
+        mock_sb = self._setup_sb_mock(where_clauses)
+
+        with patch.object(gam_app, "client") as mock_client, \
+             patch.object(gam_app.ad_manager, "StatementBuilder", return_value=mock_sb):
+            mock_client.GetService.return_value = mock_inventory
+            resp = self.client.get("/gam/ad-units/all")
+
+        self.assertEqual(resp.status_code, 200)
+        data = resp.get_json()
+        # Only the leaf unit should be returned
+        self.assertEqual(len(data), 1)
+        self.assertEqual(data[0]["gam_id"], "201")
+        # Hierarchy unit must NOT be present
+        gam_ids = [u["gam_id"] for u in data]
+        self.assertNotIn("202", gam_ids)
+
+    # ------------------------------------------------------------------
+    # s11: No hasChildren in PQL WHERE clause
+    # ------------------------------------------------------------------
+    def test_s11_no_haschildren_pql_filter(self):
+        """AC-5: getAdUnitsByStatement must NOT pass hasChildren in WHERE."""
+        mock_inventory = MagicMock()
+        mock_inventory.getAdUnitsByStatement.return_value = {"results": None}
+
+        where_clauses = []
+        mock_sb = self._setup_sb_mock(where_clauses)
+
+        with patch.object(gam_app, "client") as mock_client, \
+             patch.object(gam_app.ad_manager, "StatementBuilder", return_value=mock_sb):
+            mock_client.GetService.return_value = mock_inventory
+            self.client.get("/gam/ad-units/all")
+
+        # Where() must have been called (the pre-filter parentId IS NOT NULL)
+        self.assertTrue(len(where_clauses) > 0, "Expected at least one WHERE clause call")
+        for clause in where_clauses:
+            self.assertNotIn(
+                "hasChildren",
+                clause,
+                f"hasChildren must not appear in PQL WHERE clause: '{clause}'"
+            )
+
+    # ------------------------------------------------------------------
+    # s12: Pagination — two pages fetched
+    # ------------------------------------------------------------------
+    def test_s12_pagination_fetches_all_pages(self):
+        """AC-4: Pagination must use raw SOAP result count for break/offset logic."""
+        # 500 leaf units on first page; empty second page
+        first_page = [
+            self._make_ad_unit(str(i), f"vtvprime/mob/leaf{i}", False)
+            for i in range(500)
+        ]
+
+        mock_inventory = MagicMock()
+        mock_inventory.getAdUnitsByStatement.side_effect = [
+            {"results": first_page},
+            {"results": None},
+        ]
+
+        mock_sb = self._setup_sb_mock()
+
+        with patch.object(gam_app, "client") as mock_client, \
+             patch.object(gam_app.ad_manager, "StatementBuilder", return_value=mock_sb):
+            mock_client.GetService.return_value = mock_inventory
+            resp = self.client.get("/gam/ad-units/all")
+
+        self.assertEqual(resp.status_code, 200)
+        # getAdUnitsByStatement must have been called twice (page 1 + empty page 2)
+        self.assertEqual(mock_inventory.getAdUnitsByStatement.call_count, 2)
+        data = resp.get_json()
+        self.assertEqual(len(data), 500)
+
+    # ------------------------------------------------------------------
+    # s13: SOAP fault returns GAM_ERROR (not INTERNAL_ERROR)
+    # ------------------------------------------------------------------
+    def test_s13_soap_fault_returns_gam_error(self):
+        """AC fix: SOAP fault must produce GAM_ERROR 500, not INTERNAL_ERROR."""
+        mock_inventory = MagicMock()
+        mock_inventory.getAdUnitsByStatement.side_effect = Exception(
+            "GoogleAdsServerFault: hasChildren is not a valid PQL filter"
+        )
+
+        mock_sb = self._setup_sb_mock()
+
+        with patch.object(gam_app, "client") as mock_client, \
+             patch.object(gam_app.ad_manager, "StatementBuilder", return_value=mock_sb):
+            mock_client.GetService.return_value = mock_inventory
+            resp = self.client.get("/gam/ad-units/all")
+
+        self.assertEqual(resp.status_code, 500)
+        data = resp.get_json()
+        # Must be GAM_ERROR, not INTERNAL_ERROR (which is the Flask global handler)
+        self.assertEqual(data["error"], "GAM_ERROR")
+
+    # ------------------------------------------------------------------
+    # s13b: Empty network returns 200 with empty array
+    # ------------------------------------------------------------------
+    def test_s13b_empty_network_returns_200(self):
+        """AC-6: Zero ad units should return HTTP 200 with []."""
+        mock_inventory = MagicMock()
+        mock_inventory.getAdUnitsByStatement.return_value = {"results": None}
+
+        mock_sb = self._setup_sb_mock()
+
+        with patch.object(gam_app, "client") as mock_client, \
+             patch.object(gam_app.ad_manager, "StatementBuilder", return_value=mock_sb):
+            mock_client.GetService.return_value = mock_inventory
+            resp = self.client.get("/gam/ad-units/all")
+
+        self.assertEqual(resp.status_code, 200)
+        data = resp.get_json()
+        self.assertEqual(data, [])
+
+    # ------------------------------------------------------------------
+    # Meta-test: Regression guard — scan production code for hasChildren PQL
+    # ------------------------------------------------------------------
+    def test_meta_no_haschidren_pql_in_production_code(self):
+        """Regression guard: no .Where() call in app.py passes hasChildren."""
+        import re
+        app_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app.py")
+        with open(app_path, "r") as f:
+            source = f.read()
+
+        # Find all .Where("...") calls
+        where_calls = re.findall(r'\.Where\("([^"]+)"\)', source)
+        for clause in where_calls:
+            self.assertNotIn(
+                "hasChildren",
+                clause,
+                f"Found invalid hasChildren PQL filter in app.py: .Where(\"{clause}\")"
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
