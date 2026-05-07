@@ -895,11 +895,18 @@ def _archive_ad_unit(gam_id):
 
 @app.errorhandler(Exception)
 def handle_exception(exc):
-    """Prevent stack trace leaks for any unhandled exception."""
+    """Surface exception type + sanitized message so worker logs are diagnostic.
+    Stack traces are written via logger.exception (server-side only); the
+    response body carries only the exception class name and a sanitized,
+    truncated message so 'INTERNAL_ERROR' stops being a black box.
+    """
     logger.exception("Unhandled exception")
     return jsonify({
         "error": "INTERNAL_ERROR",
-        "message": "An unexpected error occurred",
+        "exceptionType": type(exc).__name__,
+        "message": _sanitize_fault_message(exc),
+        "path": request.path,
+        "method": request.method,
     }), 500
 
 
