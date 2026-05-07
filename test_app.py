@@ -761,5 +761,307 @@ class TestHealthSanitization(BaseTestCase):
         self.assertIn("auth", message)
 
 
+# =========================================================================
+# gam-batched-bulk-deploy: P-01..P-07 — proxy batch endpoints
+# =========================================================================
+class TestBatchCreateAdUnitsHappyPath(BaseTestCase):
+    """P-01 / FR-1: POST /gam/ad-units/batch single SOAP call returns per-item ids."""
+
+    def test_returns_per_item_ids_with_single_soap_call(self):
+        mock_inventory = MagicMock()
+        # SDK returns the created units in input order.
+        mock_inventory.createAdUnits.return_value = [
+            {"id": "111"},
+            {"id": "222"},
+            {"id": "333"},
+        ]
+
+        body = {
+            "adUnits": [
+                {"name": "feed", "adUnitCode": "feed", "parentId": "987",
+                 "adUnitSizes": [{"size": {"width": 300, "height": 250}, "environmentType": "BROWSER"}],
+                 "targetWindow": "BLANK"},
+                {"name": "banner", "adUnitCode": "banner", "parentId": "987",
+                 "adUnitSizes": [{"size": {"width": 728, "height": 90}, "environmentType": "BROWSER"}],
+                 "targetWindow": "BLANK"},
+                {"name": "pre", "adUnitCode": "pre", "parentId": "988",
+                 "adUnitSizes": [{"size": {"width": 640, "height": 480}, "environmentType": "VIDEO_PLAYER"}],
+                 "targetWindow": "BLANK"},
+            ]
+        }
+
+        with patch.object(gam_app, "client") as mock_client:
+            mock_client.GetService.return_value = mock_inventory
+            resp = self.client.post(
+                "/gam/ad-units/batch",
+                data=json.dumps(body),
+                content_type="application/json",
+            )
+
+        self.assertEqual(resp.status_code, 200)
+        data = resp.get_json()
+        self.assertEqual(data["totalSucceeded"], 3)
+        self.assertEqual(data["totalFailed"], 0)
+        self.assertEqual(len(data["results"]), 3)
+        self.assertEqual(data["results"][0], {"index": 0, "id": "111", "success": True})
+        self.assertEqual(data["results"][1], {"index": 1, "id": "222", "success": True})
+        self.assertEqual(data["results"][2], {"index": 2, "id": "333", "success": True})
+        # SOAP called EXACTLY ONCE with the 3-item list.
+        self.assertEqual(mock_inventory.createAdUnits.call_count, 1)
+        call_arg = mock_inventory.createAdUnits.call_args[0][0]
+        self.assertEqual(len(call_arg), 3)
+
+
+class TestBatchCreatePerItemAttribution(BaseTestCase):
+    """P-02 / FR-1 / BR-13: per-item fault attribution via fieldPath[i]."""
+
+    def test_attributes_failure_to_specific_index(self):
+        mock_inventory = MagicMock()
+        # Construct a SOAP fault with a single ApiError pointing at index 1.
+        api_err = MagicMock()
+        api_err.fieldPath = "adUnits[1].adUnitSizes[0].size.width"
+        api_err.errorString = "INVALID_FIELD"
+        api_err.message = "Width must be > 0"
+        api_err.trigger = "Width must be > 0"
+        fault = FakeGoogleAdsServerFault("opaque")
+        fault.errors = [api_err]
+        mock_inventory.createAdUnits.side_effect = fault
+
+        body = {
+            "adUnits": [
+                {"name": "feed", "adUnitCode": "feed", "parentId": "987",
+                 "adUnitSizes": [{"size": {"width": 300, "height": 250}, "environmentType": "BROWSER"}]},
+                {"name": "bad", "adUnitCode": "bad", "parentId": "987",
+                 "adUnitSizes": [{"size": {"width": 0, "height": 250}, "environmentType": "BROWSER"}]},
+                {"name": "banner", "adUnitCode": "banner", "parentId": "987",
+                 "adUnitSizes": [{"size": {"width": 728, "height": 90}, "environmentType": "BROWSER"}]},
+            ]
+        }
+
+        with patch.object(gam_app, "client") as mock_client:
+            mock_client.GetService.return_value = mock_inventory
+            resp = self.client.post(
+                "/gam/ad-units/batch",
+                data=json.dumps(body),
+                content_type="application/json",
+            )
+
+        self.assertEqual(resp.status_code, 200)
+        data = resp.get_json()
+        self.assertEqual(len(data["results"]), 3)
+        self.assertEqual(data["totalSucceeded"], 2)
+        self.assertEqual(data["totalFailed"], 1)
+
+        self.assertTrue(data["results"][0]["success"])
+        self.assertFalse(data["results"][1]["success"])
+        self.assertEqual(data["results"][1]["error"], "INVALID_FIELD")
+        self.assertEqual(data["results"][1]["fieldPath"], "adUnits[1].adUnitSizes[0].size.width")
+        self.assertIn("Width", data["results"][1]["message"])
+        self.assertTrue(data["results"][2]["success"])
+
+
+class TestBatchUpdateAdUnitsHappyPath(BaseTestCase):
+    """P-03 / FR-2: PATCH /gam/ad-units/batch happy path echoes input ids."""
+
+    def test_returns_echoed_ids_on_update(self):
+        mock_inventory = MagicMock()
+        mock_inventory.updateAdUnits.return_value = [
+            {"id": "111"},
+            {"id": "222"},
+        ]
+        body = {
+            "updates": [
+                {"id": "111", "name": "feed-updated",
+                 "adUnitSizes": [{"size": {"width": 300, "height": 600}, "environmentType": "BROWSER"}],
+                 "targetWindow": "BLANK"},
+                {"id": "222", "name": "banner-updated",
+                 "adUnitSizes": [{"size": {"width": 728, "height": 90}, "environmentType": "BROWSER"}],
+                 "targetWindow": "BLANK"},
+            ]
+        }
+
+        with patch.object(gam_app, "client") as mock_client:
+            mock_client.GetService.return_value = mock_inventory
+            resp = self.client.patch(
+                "/gam/ad-units/batch",
+                data=json.dumps(body),
+                content_type="application/json",
+            )
+
+        self.assertEqual(resp.status_code, 200)
+        data = resp.get_json()
+        self.assertEqual(data["totalSucceeded"], 2)
+        self.assertEqual(data["totalFailed"], 0)
+        self.assertEqual(data["results"][0], {"index": 0, "id": "111", "success": True})
+        self.assertEqual(data["results"][1], {"index": 1, "id": "222", "success": True})
+        self.assertEqual(mock_inventory.updateAdUnits.call_count, 1)
+
+
+class TestBatchCreateWholeBatchFault(BaseTestCase):
+    """P-04 / FR-3: whole-batch fault returns HTTP 500 with GAM_ERROR."""
+
+    def test_unattributable_fault_returns_500(self):
+        mock_inventory = MagicMock()
+        # Fault with NO .errors entries → not per-item attributable.
+        fault = FakeGoogleAdsServerFault("ServerError: internal failure")
+        # Note: no .errors attribute → triggers fallback path; substring matches
+        # against rate-limit / already-exists tokens; "ServerError" matches none.
+        mock_inventory.createAdUnits.side_effect = fault
+
+        body = {"adUnits": [
+            {"name": "feed", "adUnitCode": "feed", "parentId": "987", "adUnitSizes": []}
+        ]}
+
+        with patch.object(gam_app, "client") as mock_client:
+            mock_client.GetService.return_value = mock_inventory
+            resp = self.client.post(
+                "/gam/ad-units/batch",
+                data=json.dumps(body),
+                content_type="application/json",
+            )
+
+        self.assertEqual(resp.status_code, 500)
+        data = resp.get_json()
+        self.assertEqual(data["error"], "GAM_ERROR")
+        self.assertIn("InventoryService.createAdUnits failed", data["message"])
+
+
+class TestBatchCreateRateLimited(BaseTestCase):
+    """P-04 variant / FR-3: whole-batch rate-limit fault returns HTTP 429."""
+
+    def test_rate_limit_fault_returns_429(self):
+        mock_inventory = MagicMock()
+        fault = FakeGoogleAdsServerFault("QuotaError: rate limit exceeded")
+        mock_inventory.createAdUnits.side_effect = fault
+
+        body = {"adUnits": [
+            {"name": "feed", "adUnitCode": "feed", "parentId": "987", "adUnitSizes": []}
+        ]}
+
+        with patch.object(gam_app, "client") as mock_client:
+            mock_client.GetService.return_value = mock_inventory
+            resp = self.client.post(
+                "/gam/ad-units/batch",
+                data=json.dumps(body),
+                content_type="application/json",
+            )
+
+        self.assertEqual(resp.status_code, 429)
+        data = resp.get_json()
+        self.assertEqual(data["error"], "RATE_LIMITED")
+        self.assertEqual(data["retryAfter"], 5)
+
+
+class TestLookupBatchFoundCodes(BaseTestCase):
+    """P-05 / FR-4: lookup-batch returns found codes (missing absent from list)."""
+
+    def test_returns_found_codes_only(self):
+        mock_inventory = MagicMock()
+        mock_inventory.getAdUnitsByStatement.return_value = {
+            "results": [
+                {"id": "111", "adUnitCode": "feed", "status": "ACTIVE"},
+                {"id": "222", "adUnitCode": "banner", "status": "ACTIVE"},
+            ]
+        }
+        mock_sb = MagicMock()
+        mock_sb.Where.return_value = mock_sb
+        mock_sb.WithBindVariable.return_value = mock_sb
+        mock_sb.ToStatement.return_value = "fake_statement"
+
+        with patch.object(gam_app, "client") as mock_client, \
+             patch.object(gam_app.ad_manager, "StatementBuilder", return_value=mock_sb):
+            mock_client.GetService.return_value = mock_inventory
+            resp = self.client.get("/gam/ad-units/lookup-batch?codes=feed,banner,missing&parentId=987")
+
+        self.assertEqual(resp.status_code, 200)
+        data = resp.get_json()
+        self.assertEqual(len(data["results"]), 2)
+        self.assertEqual(data["results"][0], {"adUnitCode": "feed", "id": "111", "status": "ACTIVE"})
+        self.assertEqual(data["results"][1], {"adUnitCode": "banner", "id": "222", "status": "ACTIVE"})
+        self.assertEqual(mock_inventory.getAdUnitsByStatement.call_count, 1)
+        # Verify Where clause uses IN with bind variables.
+        where_calls = mock_sb.Where.call_args_list
+        self.assertTrue(len(where_calls) >= 1)
+        clause = where_calls[0][0][0]
+        self.assertIn("adUnitCode IN", clause)
+        self.assertIn("parentId = :parentId", clause)
+
+
+class TestLookupBatchEmpty(BaseTestCase):
+    """P-06 / FR-4: lookup-batch empty result is HTTP 200 with empty array."""
+
+    def test_returns_200_with_empty_array_when_none_found(self):
+        mock_inventory = MagicMock()
+        mock_inventory.getAdUnitsByStatement.return_value = {"results": None}
+        mock_sb = MagicMock()
+        mock_sb.Where.return_value = mock_sb
+        mock_sb.WithBindVariable.return_value = mock_sb
+        mock_sb.ToStatement.return_value = "fake_statement"
+
+        with patch.object(gam_app, "client") as mock_client, \
+             patch.object(gam_app.ad_manager, "StatementBuilder", return_value=mock_sb):
+            mock_client.GetService.return_value = mock_inventory
+            resp = self.client.get("/gam/ad-units/lookup-batch?codes=feed,banner,pre&parentId=987")
+
+        self.assertEqual(resp.status_code, 200)
+        data = resp.get_json()
+        self.assertEqual(data["results"], [])
+
+
+class TestBatchValidationEmptyBodies(BaseTestCase):
+    """P-07 / FR-5: empty / missing-key / empty-array bodies → HTTP 400."""
+
+    def test_post_empty_body_returns_400(self):
+        resp = self.client.post(
+            "/gam/ad-units/batch",
+            data=json.dumps({}),
+            content_type="application/json",
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.get_json()["error"], "VALIDATION_ERROR")
+
+    def test_post_missing_adUnits_key_returns_400(self):
+        resp = self.client.post(
+            "/gam/ad-units/batch",
+            data=json.dumps({"other": []}),
+            content_type="application/json",
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.get_json()["error"], "VALIDATION_ERROR")
+
+    def test_post_empty_adUnits_array_returns_400(self):
+        resp = self.client.post(
+            "/gam/ad-units/batch",
+            data=json.dumps({"adUnits": []}),
+            content_type="application/json",
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.get_json()["error"], "VALIDATION_ERROR")
+
+    def test_patch_empty_updates_returns_400(self):
+        resp = self.client.patch(
+            "/gam/ad-units/batch",
+            data=json.dumps({"updates": []}),
+            content_type="application/json",
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.get_json()["error"], "VALIDATION_ERROR")
+
+    def test_lookup_batch_missing_codes_returns_400(self):
+        resp = self.client.get("/gam/ad-units/lookup-batch?parentId=987")
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.get_json()["error"], "VALIDATION_ERROR")
+
+    def test_lookup_batch_missing_parentId_returns_400(self):
+        resp = self.client.get("/gam/ad-units/lookup-batch?codes=feed,banner")
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.get_json()["error"], "VALIDATION_ERROR")
+
+    def test_lookup_batch_empty_codes_returns_400(self):
+        resp = self.client.get("/gam/ad-units/lookup-batch?codes=&parentId=987")
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.get_json()["error"], "VALIDATION_ERROR")
+
+
 if __name__ == "__main__":
     unittest.main()
