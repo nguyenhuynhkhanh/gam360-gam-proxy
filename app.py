@@ -245,12 +245,20 @@ def ad_units():
     return _create_ad_unit()
 
 
-@app.route("/gam/ad-units/<gam_id>", methods=["PATCH", "DELETE"])
+@app.route("/gam/ad-units/<gam_id>", methods=["GET", "PATCH", "DELETE"])
 def modify_ad_unit(gam_id):
-    """PATCH or DELETE /gam/ad-units/<gam_id>."""
+    """GET, PATCH or DELETE /gam/ad-units/<gam_id>."""
+    if request.method == "GET":
+        return _get_ad_unit_by_id(gam_id)
     if request.method == "DELETE":
         return _archive_ad_unit(gam_id)
     return _update_ad_unit(gam_id)
+
+
+@app.route("/gam/ad-units/<gam_id>/reactivate", methods=["POST"])
+def reactivate_ad_unit(gam_id):
+    """POST /gam/ad-units/<gam_id>/reactivate — un-archive (Activate) an ad unit."""
+    return _reactivate_ad_unit(gam_id)
 
 
 def _get_all_leaf_ad_units():
@@ -510,9 +518,13 @@ def _get_ad_unit():
             ad_unit = results[0]
             ad_unit_id = ad_unit["id"] if isinstance(ad_unit, dict) else ad_unit.id
             ad_unit_code = ad_unit["adUnitCode"] if isinstance(ad_unit, dict) else ad_unit.adUnitCode
+            ad_unit_parent = (ad_unit.get("parentId") if isinstance(ad_unit, dict) else getattr(ad_unit, "parentId", None))
+            ad_unit_status = (ad_unit.get("status") if isinstance(ad_unit, dict) else getattr(ad_unit, "status", None))
             return jsonify({
                 "id": str(ad_unit_id),
                 "adUnitCode": str(ad_unit_code),
+                "parentId": str(ad_unit_parent) if ad_unit_parent is not None else None,
+                "status": str(ad_unit_status) if ad_unit_status is not None else None,
             }), 200
 
         return jsonify({"error": "NOT_FOUND"}), 404
@@ -685,6 +697,92 @@ def _update_ad_unit(gam_id):
         return jsonify({
             "error": "GAM_ERROR",
             "message": f"InventoryService.updateAdUnits failed: {_sanitize_fault_message(exc)}",
+        }), 500
+
+
+def _get_ad_unit_by_id(gam_id):
+    """GET /gam/ad-units/<gam_id> — fetch a single ad unit's current state."""
+    try:
+        inventory_service = _inventory_service()
+        gam_id_int = int(gam_id)
+
+        statement = (
+            ad_manager.StatementBuilder(version=API_VERSION)
+            .Where("id = :id")
+            .WithBindVariable("id", gam_id_int)
+            .Limit(1)
+            .Offset(0)
+        )
+        response = inventory_service.getAdUnitsByStatement(statement.ToStatement())
+        results = getattr(response, "results", None) or (response.get("results", None) if isinstance(response, dict) else None)
+
+        if not results or len(results) == 0:
+            return jsonify({"error": "NOT_FOUND"}), 404
+
+        ad_unit = results[0]
+        unit_id = ad_unit["id"] if isinstance(ad_unit, dict) else ad_unit.id
+        unit_code = ad_unit["adUnitCode"] if isinstance(ad_unit, dict) else getattr(ad_unit, "adUnitCode", None)
+        unit_name = ad_unit["name"] if isinstance(ad_unit, dict) else getattr(ad_unit, "name", None)
+        unit_parent = ad_unit["parentId"] if isinstance(ad_unit, dict) else getattr(ad_unit, "parentId", None)
+        unit_status = ad_unit["status"] if isinstance(ad_unit, dict) else getattr(ad_unit, "status", None)
+
+        return jsonify({
+            "id": str(unit_id),
+            "adUnitCode": str(unit_code) if unit_code is not None else None,
+            "name": str(unit_name) if unit_name is not None else None,
+            "parentId": str(unit_parent) if unit_parent is not None else None,
+            "status": str(unit_status) if unit_status is not None else None,
+        }), 200
+
+    except errors.GoogleAdsServerFault as fault:
+        logger.error("SOAP fault fetching ad unit %s: %s", gam_id, fault)
+        if _is_rate_limited(fault):
+            return jsonify({"error": "RATE_LIMITED", "retryAfter": 5}), 429
+        return jsonify({
+            "error": "GAM_ERROR",
+            "message": f"getAdUnitsByStatement (by id) failed: {_sanitize_fault_message(fault)}",
+        }), 500
+    except Exception as exc:
+        logger.exception("Unexpected error fetching ad unit %s", gam_id)
+        return jsonify({
+            "error": "GAM_ERROR",
+            "message": f"getAdUnitsByStatement (by id) failed: {_sanitize_fault_message(exc)}",
+        }), 500
+
+
+def _reactivate_ad_unit(gam_id):
+    """POST /gam/ad-units/<gam_id>/reactivate — un-archive an ad unit via ActivateAdUnits."""
+    try:
+        inventory_service = _inventory_service()
+        gam_id_int = int(gam_id)
+
+        statement = (
+            ad_manager.StatementBuilder(version=API_VERSION)
+            .Where("id = :id")
+            .WithBindVariable("id", gam_id_int)
+        )
+        result = inventory_service.performAdUnitAction(
+            {"xsi_type": "ActivateAdUnits"},
+            statement.ToStatement(),
+        )
+
+        count = getattr(result, "numChanges", 0) if result else 0
+        logger.info("Reactivated ad unit id=%s (numChanges=%d)", gam_id, count)
+        return jsonify({"reactivated": True, "id": str(gam_id), "numChanges": count}), 200
+
+    except errors.GoogleAdsServerFault as fault:
+        logger.error("SOAP fault reactivating ad unit %s: %s", gam_id, fault)
+        if _is_rate_limited(fault):
+            return jsonify({"error": "RATE_LIMITED", "retryAfter": 5}), 429
+        return jsonify({
+            "error": "GAM_ERROR",
+            "message": f"Reactivate failed: {_sanitize_fault_message(fault)}",
+        }), 500
+    except Exception as exc:
+        logger.exception("Unexpected error reactivating ad unit %s", gam_id)
+        return jsonify({
+            "error": "GAM_ERROR",
+            "message": f"Reactivate failed: {_sanitize_fault_message(exc)}",
         }), 500
 
 

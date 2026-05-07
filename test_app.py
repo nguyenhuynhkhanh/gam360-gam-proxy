@@ -362,7 +362,7 @@ class TestValidation(BaseTestCase):
         self.assertEqual(resp.status_code, 400)
         data = resp.get_json()
         self.assertEqual(data["error"], "VALIDATION_ERROR")
-        self.assertEqual(data["message"], "code query parameter is required")
+        self.assertEqual(data["message"], "code or name query parameter is required")
 
 
 # =========================================================================
