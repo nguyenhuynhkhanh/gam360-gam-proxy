@@ -671,6 +671,36 @@ def _update_ad_unit(gam_id):
 
     try:
         inventory_service = _inventory_service()
+
+        # Defense-in-depth: refuse PATCH on hierarchy nodes (L1/L2/L3). PATCH is for
+        # leaves only — renaming an ancestor cascades a misleading rename across the
+        # entire subtree (and broke vtvprime_staging once when a leaf row had its
+        # gam_id_stg corrupted to L1's id). Treat "no parentId" as a top-level node.
+        try:
+            gam_id_int = int(gam_id)
+        except (TypeError, ValueError):
+            return jsonify({"error": "VALIDATION_ERROR", "message": f"Invalid gam_id: {gam_id}"}), 400
+        guard_stmt = (
+            ad_manager.StatementBuilder(version=API_VERSION)
+            .Where("id = :id")
+            .WithBindVariable("id", gam_id_int)
+            .Limit(1)
+            .Offset(0)
+        )
+        guard_resp = inventory_service.getAdUnitsByStatement(guard_stmt.ToStatement())
+        guard_results = getattr(guard_resp, "results", None) or (guard_resp.get("results", None) if isinstance(guard_resp, dict) else None)
+        if not guard_results or len(guard_results) == 0:
+            return jsonify({"error": "NOT_FOUND", "message": f"Ad unit {gam_id} not found"}), 404
+        guard_unit = guard_results[0]
+        guard_parent = (guard_unit["parentId"] if isinstance(guard_unit, dict) else getattr(guard_unit, "parentId", None))
+        guard_has_children = (guard_unit["hasChildren"] if isinstance(guard_unit, dict) else getattr(guard_unit, "hasChildren", False))
+        guard_code = (guard_unit["adUnitCode"] if isinstance(guard_unit, dict) else getattr(guard_unit, "adUnitCode", None))
+        if guard_has_children or guard_parent is None:
+            return jsonify({
+                "error": "CANNOT_PATCH_HIERARCHY_NODE",
+                "message": f"Refusing PATCH on non-leaf ad unit {gam_id} (adUnitCode={guard_code}, hasChildren={bool(guard_has_children)}, parentId={guard_parent}). PATCH is for leaves only.",
+            }), 422
+
         result = inventory_service.updateAdUnits([ad_unit])
 
         updated = result[0]
