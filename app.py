@@ -417,6 +417,7 @@ def _get_ad_units_batch():
                 for ad_unit in results:
                     unit_id = ad_unit["id"] if isinstance(ad_unit, dict) else ad_unit.id
                     unit_code = (ad_unit["adUnitCode"] if isinstance(ad_unit, dict) else getattr(ad_unit, "adUnitCode", None)) or ""
+                    parent_id = ad_unit.get("parentId") if isinstance(ad_unit, dict) else getattr(ad_unit, "parentId", None)
 
                     # Extract sizes
                     raw_sizes = []
@@ -450,6 +451,7 @@ def _get_ad_units_batch():
                     all_results.append({
                         "id": str(unit_id),
                         "adUnitCode": str(unit_code),
+                        "parentId": str(parent_id) if parent_id is not None else None,
                         "sizes": sizes,
                     })
 
